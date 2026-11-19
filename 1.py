@@ -2,6 +2,7 @@ import streamlit as st
 import os
 import re
 import tempfile
+import traceback
 from datetime import datetime
 from google import genai
 from google.genai import types
@@ -15,22 +16,18 @@ import io
 # ==========================================
 st.set_page_config(page_title="Custom Gemini Pro App", layout="wide")
 
-# 1. Gemini APIキーの読み込み (Streamlit Secrets または 環境変数から取得)
 api_key = st.secrets.get("GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEY")
 if not api_key:
     st.error("⚠️ GEMINI_API_KEY が設定されていません。StreamlitのSecretsに設定してください。")
     st.stop()
 
 client = genai.Client(api_key=api_key)
-
-# 2. Google Drive 設定の読み込み
 DRIVE_FOLDER_ID = st.secrets.get("DRIVE_FOLDER_ID", "")
 
-# 3. モデルとキャッシュ対応の定義（ご要望の3モデルに変更）
-# ※supports_cache や max_out は各モデルの実際の仕様に合わせて適宜変更してください
+# ※APIで実際に有効なモデルIDを指定してください（例: gemini-2.5-pro, gemini-2.5-flash 等）
 MODELS = {
-    "gemini-4-argon": {"supports_cache": True, "max_out": 8192},
-    "gemini-4-carbon": {"supports_cache": True, "max_out": 8192},
+    "gemini-2.5-pro": {"supports_cache": True, "max_out": 8192},
+    "gemini-2.5-flash": {"supports_cache": True, "max_out": 8192},
     "gemini-3.5-flash": {"supports_cache": True, "max_out": 8192},
 }
 
@@ -53,7 +50,8 @@ if "active_cache_name" not in st.session_state:
 # ==========================================
 def save_code_to_drive(text: str, thread_name: str):
     """テキストからコードブロックを抽出しGoogle Driveに保存する"""
-    # Secretsにサービスアカウント情報があるか確認
+    if not text:
+        return
     if "gcp_service_account" not in st.secrets or not DRIVE_FOLDER_ID:
         st.toast("⚠️ Google Drive連携の設定がSecretsにないため保存をスキップしました。")
         return
@@ -65,7 +63,6 @@ def save_code_to_drive(text: str, thread_name: str):
         return
 
     try:
-        # JSONファイルではなく、Streamlit Secretsの辞書データから直接認証情報を作成
         creds_info = dict(st.secrets["gcp_service_account"])
         creds = service_account.Credentials.from_service_account_info(
             creds_info, scopes=['https://www.googleapis.com/auth/drive.file']
@@ -166,14 +163,15 @@ with st.sidebar:
                         )
                         st.session_state.active_cache_name = cache.name
                         st.success(f"キャッシュ作成完了!\nID: `{cache.name}`")
-                    except Exception as e:
-                        st.error(f"キャッシュ作成失敗 (トークン不足等の可能性があります): {e}")
+                    except Exception:
+                        st.error("キャッシュ作成失敗:")
+                        st.code(traceback.format_exc())
 
             if st.session_state.active_cache_name:
-                st.success(f"有効なキャッシュ: あり")
+                st.success("有効なキャッシュ: あり")
 
 # ==========================================
-# メイン画面: チャット履歴表示
+# メイン画面: チャット履歴表示（ターミナル風にそのまま出力）
 # ==========================================
 st.title(f"💬 {st.session_state.current_thread}")
 
@@ -181,7 +179,8 @@ current_history = st.session_state.threads[st.session_state.current_thread]
 
 for msg in current_history:
     with st.chat_message(msg["role"]):
-        st.markdown(msg["display"])
+        # Markdown解釈をせず、生テキスト（ターミナル出力）としてそのまま表示
+        st.code(msg["display"], language=None)
 
 # ==========================================
 # メイン画面: 入力フォームと2段階確認
@@ -207,7 +206,7 @@ if not st.session_state.confirm_step:
 
                 display_text = user_prompt
                 if file_names:
-                    display_text = f"📎 *添付: {', '.join(file_names)}*\n\n" + display_text
+                    display_text = f"[添付: {', '.join(file_names)}]\n\n" + display_text
 
                 api_contents = []
                 for h in current_history:
@@ -225,8 +224,9 @@ if not st.session_state.confirm_step:
                         contents=api_contents
                     )
                     input_tokens = token_resp.total_tokens
-                except Exception as e:
-                    st.error(f"トークン計算エラー: {e}")
+                except Exception:
+                    st.error("トークン計算エラー:")
+                    st.code(traceback.format_exc())
                     st.stop()
 
                 st.session_state.pending_payload = {
@@ -248,7 +248,7 @@ else:
     col3.metric("キャッシュ利用", "ON" if (use_cache and st.session_state.active_cache_name) else "OFF")
 
     with st.expander("送信内容のプレビュー", expanded=True):
-        st.markdown(payload["display_text"])
+        st.code(payload["display_text"], language=None)
 
     btn_col1, btn_col2 = st.columns([1, 5])
 
@@ -267,7 +267,8 @@ else:
                     config=gen_config
                 )
 
-                ai_text = response.text
+                # response.text が None の場合でも落ちないようにガード
+                ai_text = response.text if response.text is not None else f"[空の応答が返却されました]\n{response}"
 
                 st.session_state.threads[st.session_state.current_thread].append({
                     "role": "user",
@@ -282,12 +283,15 @@ else:
 
                 save_code_to_drive(ai_text, st.session_state.current_thread)
 
-            except Exception as e:
-                st.error(f"API送信エラー: {e}")
-            finally:
+                # 成功時のみ確認状態をリセットして画面を更新する
                 st.session_state.confirm_step = False
                 st.session_state.pending_payload = None
                 st.rerun()
+
+            except Exception:
+                # エラー時はリロードせず、ターミナルと同じトレースバックをそのまま表示
+                st.error("API送信エラーが発生しました（履歴は保存されていません）:")
+                st.code(traceback.format_exc())
 
     if btn_col2.button("キャンセルして編集に戻る"):
         st.session_state.confirm_step = False

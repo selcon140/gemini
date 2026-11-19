@@ -1,0 +1,4 @@
+.venv/
+__pycache__/
+.env
+study-database-511319-b000ed6a69ee.json
